@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -19,6 +17,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/client-go/util/workqueue"
+	"os"
+	"path/filepath"
 )
 
 func convertToStringKeyMap(input interface{}) interface{} {
@@ -42,7 +42,13 @@ func convertToStringKeyMap(input interface{}) interface{} {
 }
 
 func main() {
-	logger, _ := zap.NewProduction()
+	// Настройка логгера Zap для использования кастомного формата времени
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout("2006-01-02 15:04:05")
+	loggerConfig := zap.NewProductionConfig()
+	loggerConfig.EncoderConfig = encoderConfig
+
+	logger, _ := loggerConfig.Build()
 	defer logger.Sync()
 	sugar := logger.Sugar()
 

@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secret-watcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secret-watcher
+  template:
+    metadata:
+      labels:
+        app: secret-watcher
+    spec:
+      serviceAccountName: secret-watcher-sa
+      containers:
+        - name: secret-watcher
+          image: {{ .Values.image.name:.Values.image.tag }}
+          env:
+            - name: NAMESPACE
+              value: argocd

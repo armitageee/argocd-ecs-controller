@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"os"
+	"path/filepath"
+
+	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -17,8 +19,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/client-go/util/workqueue"
-	"os"
-	"path/filepath"
 )
 
 func convertToStringKeyMap(input interface{}) interface{} {
@@ -42,31 +42,29 @@ func convertToStringKeyMap(input interface{}) interface{} {
 }
 
 func main() {
-	// Настройка логгера Zap для использования кастомного формата времени
-	encoderConfig := zap.NewProductionEncoderConfig()
-	encoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout("2006-01-02 15:04:05")
-	loggerConfig := zap.NewProductionConfig()
-	loggerConfig.EncoderConfig = encoderConfig
-
-	logger, _ := loggerConfig.Build()
-	defer logger.Sync()
-	sugar := logger.Sugar()
+	log := logrus.New()
+	log.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+	})
+	log.SetOutput(os.Stdout)
+	log.SetLevel(logrus.InfoLevel)
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		if home := homedir.HomeDir(); home != "" {
 			config, err = clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
 			if err != nil {
-				sugar.Fatalf("Failed to build config: %v", err)
+				log.Fatalf("Failed to build config: %v", err)
 			}
 		} else {
-			sugar.Fatalf("Failed to build in-cluster config: %v", err)
+			log.Fatalf("Failed to build in-cluster config: %v", err)
 		}
 	}
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		sugar.Fatalf("Failed to create clientset: %v", err)
+		log.Fatalf("Failed to create clientset: %v", err)
 	}
 
 	watchlist := cache.NewListWatchFromClient(
@@ -81,13 +79,16 @@ func main() {
 	_, controller := cache.NewInformer(
 		watchlist,
 		&corev1.Secret{},
-		0, // No resync period
+		0,
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
-				key, err := cache.MetaNamespaceKeyFunc(obj)
-				if err == nil {
-					queue.Add(key)
-					sugar.Infof("Secret added: %s", key)
+				secret, ok := obj.(*corev1.Secret)
+				if ok && secret.Labels["cluster"] == "true" {
+					key, err := cache.MetaNamespaceKeyFunc(obj)
+					if err == nil {
+						queue.Add(key)
+						log.Infof("Secret added: %s", key)
+					}
 				}
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
@@ -97,15 +98,18 @@ func main() {
 					key, err := cache.MetaNamespaceKeyFunc(newObj)
 					if err == nil {
 						queue.Add(key)
-						sugar.Infof("Secret updated: %s", key)
+						log.Infof("Secret updated: %s", key)
 					}
 				}
 			},
 			DeleteFunc: func(obj interface{}) {
-				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				if err == nil {
-					queue.Add(key)
-					sugar.Infof("Secret deletion detected: %s", key)
+				secret, ok := obj.(*corev1.Secret)
+				if ok && secret.Labels["cluster"] == "true" {
+					key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+					if err == nil {
+						queue.Add(key)
+						log.Infof("Secret deletion detected: %s", key)
+					}
 				}
 			},
 		},
@@ -122,24 +126,24 @@ func main() {
 				defer queue.Done(obj)
 				key, ok := obj.(string)
 				if !ok {
-					sugar.Errorf("Invalid key type: %v", obj)
+					log.Errorf("Invalid key type: %v", obj)
 					return
 				}
 
 				namespace, name, err := cache.SplitMetaNamespaceKey(key)
 				if err != nil {
-					sugar.Errorf("Error splitting key: %v", err)
+					log.Errorf("Error splitting key: %v", err)
 					return
 				}
 
 				secret, err := clientset.CoreV1().Secrets(namespace).Get(context.Background(), name, metav1.GetOptions{})
 				if errors.IsNotFound(err) {
-					handleDeleteSecret(clientset, namespace, fmt.Sprintf("%s-argocd-cluster", name), sugar)
+					log.Infof("Derived secret %s already deleted", name)
 				} else if err != nil {
-					sugar.Errorf("Error getting secret: %v", err)
+					log.Errorf("Error getting secret: %v", err)
 					return
 				} else {
-					handleAddOrUpdateSecret(clientset, secret, sugar)
+					handleAddOrUpdateSecret(clientset, secret, log)
 				}
 			}(obj)
 		}
@@ -160,21 +164,21 @@ func secretNeedsUpdate(oldSecret, newSecret *corev1.Secret) bool {
 	return false
 }
 
-func handleAddOrUpdateSecret(clientset *kubernetes.Clientset, secret *corev1.Secret, sugar *zap.SugaredLogger) {
+func handleAddOrUpdateSecret(clientset kubernetes.Interface, secret *corev1.Secret, log *logrus.Logger) {
 	if val, ok := secret.Labels["cluster"]; !ok || val != "true" {
-		sugar.Infof("Secret %s does not have label 'cluster: true', skipping", secret.Name)
+		log.Infof("Secret %s does not have label 'cluster: true', skipping", secret.Name)
 		return
 	}
 
 	kubeconfigData, ok := secret.Data["kubeconfig"]
 	if !ok {
-		sugar.Infof("kubeconfig not found in secret %s, skipping", secret.Name)
+		log.Infof("kubeconfig not found in secret %s, skipping", secret.Name)
 		return
 	}
 
 	var kubeconfig interface{}
 	if err := yaml.Unmarshal(kubeconfigData, &kubeconfig); err != nil {
-		sugar.Errorf("Error parsing kubeconfig: %v", err)
+		log.Errorf("Error parsing kubeconfig: %v", err)
 		return
 	}
 
@@ -182,35 +186,20 @@ func handleAddOrUpdateSecret(clientset *kubernetes.Clientset, secret *corev1.Sec
 	server := kubeconfigMap["clusters"].([]interface{})[0].(map[string]interface{})["cluster"].(map[string]interface{})["server"].(string)
 	token := kubeconfigMap["users"].([]interface{})[0].(map[string]interface{})["user"].(map[string]interface{})["token"].(string)
 
-	existingSecret, err := clientset.CoreV1().Secrets(secret.Namespace).Get(context.Background(), fmt.Sprintf("%s-argocd-cluster", secret.Name), metav1.GetOptions{})
-	if err == nil {
-		// Секрет существует, обновляем его
-		existingSecret.StringData = map[string]string{
-			"name":       secret.Name,
-			"server":     server,
-			"namespaces": "",
-			"config": fmt.Sprintf(`{
-                "bearerToken": "%s",
-                "tlsClientConfig": {
-                    "insecure": false
-                }
-            }`, token),
-		}
-		_, err = clientset.CoreV1().Secrets(secret.Namespace).Update(context.Background(), existingSecret, metav1.UpdateOptions{})
-		if err != nil {
-			sugar.Errorf("Error updating derived secret: %v", err)
-		} else {
-			sugar.Infof("Derived secret %s updated successfully", existingSecret.Name)
-		}
-	} else if errors.IsNotFound(err) {
-		// Секрет не существует, создаём его
-		createNewSecret(clientset, secret, server, token, sugar)
+	derivedSecretName := fmt.Sprintf("%s-argocd-cluster", secret.Name)
+	_, err := clientset.CoreV1().Secrets(secret.Namespace).Get(context.Background(), derivedSecretName, metav1.GetOptions{})
+
+	if errors.IsNotFound(err) {
+		// Секрет не найден, создаём его
+		createNewSecret(clientset, secret, server, token, log)
+	} else if err != nil {
+		log.Errorf("Error retrieving derived secret: %v", err)
 	} else {
-		sugar.Errorf("Error retrieving derived secret: %v", err)
+		log.Infof("Derived secret %s already exists, no action required", derivedSecretName)
 	}
 }
 
-func createNewSecret(clientset *kubernetes.Clientset, secret *corev1.Secret, server, token string, sugar *zap.SugaredLogger) {
+func createNewSecret(clientset kubernetes.Interface, secret *corev1.Secret, server, token string, log *logrus.Logger) {
 	newSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("%s-argocd-cluster", secret.Name),
@@ -234,17 +223,8 @@ func createNewSecret(clientset *kubernetes.Clientset, secret *corev1.Secret, ser
 
 	_, err := clientset.CoreV1().Secrets(secret.Namespace).Create(context.Background(), newSecret, metav1.CreateOptions{})
 	if err != nil {
-		sugar.Errorf("Error creating new derived secret: %v", err)
+		log.Errorf("Error creating new derived secret: %v", err)
 	} else {
-		sugar.Infof("Derived secret %s created successfully", newSecret.Name)
-	}
-}
-
-func handleDeleteSecret(clientset *kubernetes.Clientset, namespace, name string, sugar *zap.SugaredLogger) {
-	err := clientset.CoreV1().Secrets(namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
-	if err != nil {
-		sugar.Errorf("Error deleting derived secret: %v", err)
-	} else {
-		sugar.Infof("Derived secret %s deleted successfully", name)
+		log.Infof("Derived secret %s created successfully", newSecret.Name)
 	}
 }

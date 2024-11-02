@@ -1,9 +1,12 @@
 package main
-
 import (
-	"bytes"
+  "time"
+  "bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
@@ -16,9 +19,40 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/client-go/util/workqueue"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 )
+
+
+var (
+	cpuUsageGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "app_cpu_usage",
+		Help: "CPU usage of the application",
+	})
+	memoryUsageGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "app_memory_usage",
+		Help: "Memory usage of the application",
+	})
+	secretsAddedCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "secrets_added_total",
+		Help: "Total number of secrets added",
+	})
+	secretsUpdatedCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "secrets_updated_total",
+		Help: "Total number of secrets updated",
+	})
+	secretsDeletedCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "secrets_deleted_total",
+		Help: "Total number of secrets deleted",
+	})
+)
+
+func init() {
+	// Register Prometheus metrics
+	prometheus.MustRegister(cpuUsageGauge, memoryUsageGauge, secretsAddedCounter, secretsUpdatedCounter, secretsDeletedCounter)
+}
 
 func convertToStringKeyMap(input interface{}) interface{} {
 	switch in := input.(type) {
@@ -40,6 +74,11 @@ func convertToStringKeyMap(input interface{}) interface{} {
 	return input
 }
 
+func isBase64Encoded(data []byte) bool {
+	_, err := base64.StdEncoding.DecodeString(string(data))
+	return err == nil
+}
+
 func main() {
 	// Настройка логгера logrus
 	logger := logrus.New()
@@ -47,6 +86,14 @@ func main() {
 		TimestampFormat: "2006-01-02 15:04:05",
 		FullTimestamp:   true,
 	})
+
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		logger.Infof("Starting Prometheus metrics endpoint on :2112/metrics")
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			logger.Fatalf("Error starting metrics endpoint: %v", err)
+		}
+	}()
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -65,6 +112,7 @@ func main() {
 		logger.Fatalf("Failed to create clientset: %v", err)
 	}
 
+	// Watch for secrets
 	watchlist := cache.NewListWatchFromClient(
 		clientset.CoreV1().RESTClient(),
 		"secrets",
@@ -83,6 +131,7 @@ func main() {
 				key, err := cache.MetaNamespaceKeyFunc(obj)
 				if err == nil {
 					queue.Add(key)
+					secretsAddedCounter.Inc()
 					logger.Infof("Secret added: %s", key)
 				}
 			},
@@ -93,6 +142,7 @@ func main() {
 					key, err := cache.MetaNamespaceKeyFunc(newObj)
 					if err == nil {
 						queue.Add(key)
+						secretsUpdatedCounter.Inc()
 						logger.Infof("Secret updated: %s", key)
 					}
 				}
@@ -101,11 +151,15 @@ func main() {
 				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 				if err == nil {
 					queue.Add(key)
+					secretsDeletedCounter.Inc()
 					logger.Infof("Secret deletion detected: %s", key)
 				}
 			},
 		},
 	)
+
+	// Monitor CPU and memory usage periodically
+	go monitorSystemUsage(logger)
 
 	go func() {
 		for {
@@ -168,8 +222,22 @@ func handleAddOrUpdateSecret(clientset *kubernetes.Clientset, secret *corev1.Sec
 		return
 	}
 
+	// Проверка, закодированы ли данные в base64
+	var decodedKubeconfigData []byte
+	if isBase64Encoded(kubeconfigData) {
+		logger.Infof("Kubeconfig is in base64 format, decoding...")
+		decodedData, err := base64.StdEncoding.DecodeString(string(kubeconfigData))
+		if err != nil {
+			logger.Errorf("Error decoding base64 kubeconfig: %v", err)
+			return
+		}
+		decodedKubeconfigData = decodedData
+	} else {
+		decodedKubeconfigData = kubeconfigData
+	}
+
 	var kubeconfig interface{}
-	if err := yaml.Unmarshal(kubeconfigData, &kubeconfig); err != nil {
+	if err := yaml.Unmarshal(decodedKubeconfigData, &kubeconfig); err != nil {
 		logger.Errorf("Error parsing kubeconfig: %v", err)
 		return
 	}
@@ -227,7 +295,6 @@ func createNewSecret(clientset *kubernetes.Clientset, secret *corev1.Secret, ser
             }`, token),
 		},
 	}
-
 	_, err := clientset.CoreV1().Secrets(secret.Namespace).Create(context.Background(), newSecret, metav1.CreateOptions{})
 	if err != nil {
 		logger.Errorf("Error creating new derived secret: %v", err)
@@ -237,7 +304,6 @@ func createNewSecret(clientset *kubernetes.Clientset, secret *corev1.Secret, ser
 }
 
 func handleDeleteSecret(clientset *kubernetes.Clientset, namespace, name string, logger *logrus.Logger) {
-	// Проверка, существует ли секрет перед удалением
 	_, err := clientset.CoreV1().Secrets(namespace).Get(context.Background(), name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		logger.Infof("Derived secret %s already deleted or does not exist, skipping", name)
@@ -246,12 +312,20 @@ func handleDeleteSecret(clientset *kubernetes.Clientset, namespace, name string,
 		logger.Errorf("Error checking for secret before deletion: %v", err)
 		return
 	}
-
-	// Если секрет найден, пытаемся удалить его
 	err = clientset.CoreV1().Secrets(namespace).Delete(context.Background(), name, metav1.DeleteOptions{})
 	if err != nil {
 		logger.Errorf("Error deleting derived secret: %v", err)
 	} else {
 		logger.Infof("Derived secret %s deleted successfully", name)
+	}
+}
+
+func monitorSystemUsage() {
+	var m runtime.MemStats
+	for {
+		runtime.ReadMemStats(&m)
+		cpuUsageGauge.Set(float64(runtime.NumGoroutine()))
+		memoryUsageGauge.Set(float64(m.Alloc) / 1024 / 1024) // MB
+		time.Sleep(10 * time.Second)
 	}
 }
